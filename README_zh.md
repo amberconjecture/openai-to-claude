@@ -54,6 +54,9 @@ cp config/example.json config/settings.json
 # 开发模式
 uv run main.py --config config/settings.json
 
+# 覆盖默认端口
+SERVER_PORT=8100 uv run main.py
+
 # 生产模式
 uv run main.py
 ```
@@ -64,6 +67,9 @@ uv run main.py
 # 构建并启动服务
 docker-compose up --build
 
+# 使用自定义端口构建并启动
+SERVER_PORT=8100 docker-compose up --build
+
 # 后台运行
 docker-compose up --build -d
 
@@ -71,7 +77,7 @@ docker-compose up --build -d
 docker-compose down
 ```
 
-服务将在 `http://localhost:8000` 启动。
+服务默认将在 `http://localhost:8000` 启动。设置一次 `SERVER_PORT` 即可同时修改应用监听端口和 Docker 端口映射。
 
 ## 🛠️ 使用方法
 
@@ -223,6 +229,9 @@ openai-to-claude/
 ### 环境变量
 
 - `CONFIG_PATH`: 配置文件路径 (默认: `config/settings.json`)
+- `SERVER_HOST`: 服务监听主机覆盖值 (默认: `0.0.0.0`)
+- `SERVER_PORT`: 服务监听端口覆盖值 (默认: `8000`)
+- `PORT`: 部署平台常用的端口覆盖值；`SERVER_PORT` 优先级更高
 - `LOG_LEVEL`: 日志级别 (默认: `INFO`)
 
 ### 配置文件 (`config/settings.json`)
@@ -265,7 +274,7 @@ openai-to-claude/
 
 - **server**: 服务器配置
   - `host`: 服务监听主机地址，默认为 `0.0.0.0`（监听所有网络接口）
-  - `port`: 服务监听端口，默认为 `8000`
+  - `port`: 服务监听端口，默认为 `8000`。可以通过 `SERVER_PORT` 或 `PORT` 覆盖，无需修改 JSON 文件
 
 - **api_key**: 代理服务的 API 密钥，用于验证访问 `/v1/messages` 端点的请求
 

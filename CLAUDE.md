@@ -56,7 +56,10 @@ uv sync
 
 ### 运行服务
 ```bash
-uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+uv run main.py
+
+# 使用自定义端口
+SERVER_PORT=8100 uv run main.py
 ```
 
 ### 运行测试
@@ -94,6 +97,9 @@ mypy src
 ### 环境变量
 - `LOG_LEVEL`: 日志级别 (默认: INFO)
 - `CONFIG_PATH`: 配置文件路径 (默认: config/settings.json)
+- `SERVER_HOST`: 服务监听主机覆盖值 (默认: 0.0.0.0)
+- `SERVER_PORT`: 服务监听端口覆盖值 (默认: 8000)
+- `PORT`: 部署平台常用的端口覆盖值，`SERVER_PORT` 优先级更高
 
 ### 配置文件 (config/settings.json)
 ```json

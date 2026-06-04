@@ -56,6 +56,9 @@ cp config/example.json config/settings.json
 # Development mode
 uv run main.py --config config/settings.json
 
+# Override the default port
+SERVER_PORT=8100 uv run main.py
+
 # Production mode
 uv run main.py
 ```
@@ -66,6 +69,9 @@ uv run main.py
 # Build and start the service
 docker-compose up --build
 
+# Build and start on a custom port
+SERVER_PORT=8100 docker-compose up --build
+
 # Run in background
 docker-compose up --build -d
 
@@ -73,7 +79,7 @@ docker-compose up --build -d
 docker-compose down
 ```
 
-The service will start at `http://localhost:8000`.
+The service will start at `http://localhost:8000` by default. Set `SERVER_PORT` once to change both the application listening port and the Docker port mapping.
 
 ## 🛠️ Usage
 
@@ -197,6 +203,9 @@ openai-to-claude/
 ### Environment Variables
 
 - `CONFIG_PATH`: Configuration file path (default: `config/settings.json`)
+- `SERVER_HOST`: Service listening host override (default: `0.0.0.0`)
+- `SERVER_PORT`: Service listening port override (default: `8000`)
+- `PORT`: Fallback service port override for deployment platforms; `SERVER_PORT` takes precedence
 - `LOG_LEVEL`: Log level (default: `INFO`)
 
 ### Configuration File (`config/settings.json`)
@@ -239,7 +248,7 @@ openai-to-claude/
 
 - **server**: Server configuration
   - `host`: Service listening host address, default is `0.0.0.0` (listen on all network interfaces)
-  - `port`: Service listening port, default is `8000`
+  - `port`: Service listening port, default is `8000`. Override with `SERVER_PORT` or `PORT` without editing the JSON file.
 
 - **api_key**: API key for the proxy service, used to verify requests to the `/v1/messages` endpoint
 

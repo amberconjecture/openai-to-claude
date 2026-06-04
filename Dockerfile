@@ -35,7 +35,8 @@ COPY . .
 RUN mkdir -p /app/logs /app/config
 
 # 暴露端口
-EXPOSE 8000
+ARG SERVER_PORT=8000
+EXPOSE ${SERVER_PORT}
 
 # 启动应用
 CMD ["/app/.venv/bin/python", "main.py"]

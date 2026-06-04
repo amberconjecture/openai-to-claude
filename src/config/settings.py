@@ -6,8 +6,23 @@ import aiofiles
 from loguru import logger
 from pydantic import BaseModel, Field, field_validator
 
+DEFAULT_CONFIG_PATH = "config/settings.json"
+SERVER_HOST_ENV = "SERVER_HOST"
+SERVER_PORT_ENV = "SERVER_PORT"
+PLATFORM_PORT_ENV = "PORT"
+LOG_LEVEL_ENV = "LOG_LEVEL"
+
 # 全局配置缓存
 _config_instance = None
+
+
+def _get_first_non_empty_env(*names: str) -> str | None:
+    """返回第一个已设置且非空的环境变量值"""
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
 
 
 async def get_config() -> "Config":
@@ -24,7 +39,8 @@ async def get_config() -> "Config":
                 openai={
                     "api_key": "your-openai-api-key-here",
                     "base_url": "https://api.openai.com/v1",
-                }
+                },
+                api_key="your-proxy-api-key-here",
             )
     return _config_instance
 
@@ -57,7 +73,8 @@ async def reload_config(config_path: str | None = None) -> "Config":
                 openai={
                     "api_key": "your-openai-api-key-here",
                     "base_url": "https://api.openai.com/v1",
-                }
+                },
+                api_key="your-proxy-api-key-here",
             )
         return _config_instance
 
@@ -68,9 +85,7 @@ def get_config_file_path() -> str:
     Returns:
         str: 配置文件路径
     """
-    import os
-
-    return os.getenv("CONFIG_PATH", "config/settings.json")
+    return os.getenv("CONFIG_PATH", DEFAULT_CONFIG_PATH)
 
 
 class OpenAIConfig(BaseModel):
@@ -86,6 +101,18 @@ class ServerConfig(BaseModel):
     host: str = Field("0.0.0.0", description="服务监听主机")
     port: int = Field(8000, gt=0, lt=65536, description="服务监听端口")
 
+    def __init__(self, **data):
+        """初始化时支持环境变量覆盖配置文件"""
+        env_host = _get_first_non_empty_env(SERVER_HOST_ENV)
+        env_port = _get_first_non_empty_env(SERVER_PORT_ENV, PLATFORM_PORT_ENV)
+
+        if env_host is not None:
+            data["host"] = env_host
+        if env_port is not None:
+            data["port"] = env_port
+
+        super().__init__(**data)
+
 
 class LoggingConfig(BaseModel):
     """日志配置"""
@@ -97,8 +124,9 @@ class LoggingConfig(BaseModel):
     def __init__(self, **data):
         """初始化时支持环境变量覆盖"""
         # 环境变量覆盖
-        if "LOG_LEVEL" in os.environ:
-            data["level"] = os.environ["LOG_LEVEL"]
+        env_level = _get_first_non_empty_env(LOG_LEVEL_ENV)
+        if env_level is not None:
+            data["level"] = env_level
 
         super().__init__(**data)
 
@@ -170,15 +198,23 @@ class Config(BaseModel):
     3. ./config/settings.json (默认)
     4. ./config/example.json (示例配置)
     5. 默认值
+
+    运行时覆盖：
+    - SERVER_HOST 覆盖 server.host
+    - SERVER_PORT 覆盖 server.port
+    - PORT 作为 server.port 的平台变量后备
+    - LOG_LEVEL 覆盖 logging.level
     """
 
     # 各模块配置
     openai: OpenAIConfig
-    server: ServerConfig = ServerConfig()
+    server: ServerConfig = Field(default_factory=ServerConfig)
     api_key: str = Field(..., description="/v1/messages接口的API密钥")
-    logging: LoggingConfig = LoggingConfig()
-    models: ModelConfig = ModelConfig()
-    parameter_overrides: ParameterOverridesConfig = ParameterOverridesConfig()
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    models: ModelConfig = Field(default_factory=ModelConfig)
+    parameter_overrides: ParameterOverridesConfig = Field(
+        default_factory=ParameterOverridesConfig
+    )
 
     @classmethod
     async def from_file(cls, config_path: str | None = None) -> "Config":
@@ -195,11 +231,9 @@ class Config(BaseModel):
             json.JSONDecodeError: JSON格式错误
             ValidationError: 配置数据验证错误
         """
-        import os
-
         if config_path is None:
             # 优先使用环境变量指定的路径
-            config_path = os.getenv("CONFIG_PATH", "config/settings.json")
+            config_path = os.getenv("CONFIG_PATH", DEFAULT_CONFIG_PATH)
 
         config_file = Path(config_path)
 
@@ -263,11 +297,9 @@ class Config(BaseModel):
             json.JSONDecodeError: JSON格式错误
             ValidationError: 配置数据验证错误
         """
-        import os
-
         if config_path is None:
             # 优先使用环境变量指定的路径
-            config_path = os.getenv("CONFIG_PATH", "config/settings.json")
+            config_path = os.getenv("CONFIG_PATH", DEFAULT_CONFIG_PATH)
 
         config_file = Path(config_path)
 
