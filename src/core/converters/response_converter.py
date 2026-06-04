@@ -427,6 +427,29 @@ class OpenAIToAnthropicConverter:
                         traceback.print_exc()
 
             if not state.has_finished:
+                has_content_block = (
+                    state.content_started
+                    or state.thinking_started
+                    or state.tool_call_chunks > 0
+                )
+                if has_content_block:
+                    bound_logger.warning(
+                        f"OpenAI stream ended without finish event; synthesizing stop - processed_chunks: {state.total_chunks}, buffer: {state.buffer[:100]}"
+                    )
+                    finish_events = process_finish_event(
+                        {"choices": [{"finish_reason": "stop"}]},
+                        state,
+                        request_id,
+                    )
+                    for event in finish_events:
+                        yield event
+                    _log_stream_completion_details(
+                        state,
+                        request_id,
+                        model,
+                    )
+                    return
+
                 bound_logger.error(
                     f"OpenAI stream ended before finish event - processed_chunks: {state.total_chunks}, buffer: {state.buffer[:100]}"
                 )

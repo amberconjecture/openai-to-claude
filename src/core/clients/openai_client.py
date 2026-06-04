@@ -1,5 +1,6 @@
 """OpenAI API client for making asynchronous requests to OpenAI endpoints."""
 
+import codecs
 import json
 import os
 from collections.abc import AsyncGenerator
@@ -257,14 +258,25 @@ class OpenAIServiceClient:
                     f"开始接收OpenAI流式响应 - Status: {response.status_code}, Content-Type: {content_type}"
                 )
 
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
+                decoder = codecs.getincrementaldecoder("utf-8")()
+                buffer = ""
 
-                    yield line
-                    if line == "data: [DONE]":
-                        return
+                async for chunk_bytes in response.aiter_bytes():
+                    buffer += decoder.decode(chunk_bytes)
+
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        yield line
+                        if line == "data: [DONE]":
+                            return
+
+                buffer += decoder.decode(b"", final=True)
+                if buffer.strip():
+                    yield buffer.strip()
 
         except httpx.HTTPStatusError as e:
             error_body = ""
