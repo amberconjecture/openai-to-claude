@@ -1,6 +1,7 @@
 """OpenAI API client for making asynchronous requests to OpenAI endpoints."""
 
 import json
+import os
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -26,7 +27,8 @@ class OpenAIServiceClient:
         self,
         api_key: str,
         base_url: str = "https://api.openai.com/v1",
-        timeout: float = 60.0,
+        timeout: float | None = None,
+        stream_read_timeout: float | None = None,
     ):
         """Initialize OpenAI client with connection pool.
 
@@ -34,10 +36,16 @@ class OpenAIServiceClient:
             api_key: OpenAI API密钥
             base_url: OpenAI API基础URL
             timeout: 请求超时时间(秒)
+            stream_read_timeout: 流式响应两次读取之间的超时时间(秒)，None 表示不限制
         """
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else self._get_timeout_from_env()
+        self.stream_read_timeout = stream_read_timeout
+        if stream_read_timeout is None and os.getenv("STREAM_READ_TIMEOUT"):
+            self.stream_read_timeout = self._get_timeout_from_env(
+                "STREAM_READ_TIMEOUT", default=None
+            )
 
         self.client = httpx.AsyncClient(
             headers={
@@ -47,8 +55,23 @@ class OpenAIServiceClient:
             },
             # 确保自动解压缩响应
             follow_redirects=True,
-            timeout=timeout,
+            timeout=self.timeout,
         )
+
+    @staticmethod
+    def _get_timeout_from_env(
+        env_name: str = "REQUEST_TIMEOUT", default: float | None = 60.0
+    ) -> float | None:
+        """Read a positive timeout value from the environment."""
+        raw_value = os.getenv(env_name)
+        if raw_value is None or raw_value == "":
+            return default
+        try:
+            timeout = float(raw_value)
+        except ValueError:
+            logger.warning(f"Invalid {env_name} value: {raw_value!r}, using {default}")
+            return default
+        return timeout if timeout > 0 else default
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -214,10 +237,17 @@ class OpenAIServiceClient:
         )
         
         try:
+            stream_timeout = httpx.Timeout(
+                connect=self.timeout,
+                read=self.stream_read_timeout,
+                write=self.timeout,
+                pool=self.timeout,
+            )
             async with self.client.stream(
                 "POST",
                 url,
                 json=request_dict,
+                timeout=stream_timeout,
             ) as response:
                 response.raise_for_status()
 
@@ -227,28 +257,14 @@ class OpenAIServiceClient:
                     f"开始接收OpenAI流式响应 - Status: {response.status_code}, Content-Type: {content_type}"
                 )
 
-                buffer = ""
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
 
-                async for chunk_bytes in response.aiter_bytes(chunk_size=1024):
-                    chunk_text = chunk_bytes.decode("utf-8", errors="ignore")
-                    buffer += chunk_text
-
-                    # 处理完整的行
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-
-                        # 直接转发非空行
-                        if line:
-                            # logger.debug(f"Forwarding line: {line}")
-                            yield line
-                            # 检查是否结束
-                            if line == "data: [DONE]":
-                                return
-
-                # 处理最后可能剩余的数据
-                if buffer.strip():
-                    yield buffer.strip()
+                    yield line
+                    if line == "data: [DONE]":
+                        return
 
         except httpx.HTTPStatusError as e:
             error_body = ""
@@ -292,6 +308,21 @@ class OpenAIServiceClient:
                     status_code=502,
                     message="Connection error",
                     details={"type": "connection_error"},
+                )
+            )
+
+        except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+            bound_logger.error(
+                f"OpenAI API 流式连接中断 - Type: {type(e).__name__}, Error: {str(e)}"
+            )
+            raise OpenAIClientError(
+                get_error_response(
+                    status_code=502,
+                    message="Stream interrupted by upstream OpenAI-compatible service",
+                    details={
+                        "type": "stream_interrupted",
+                        "original_error": str(e),
+                    },
                 )
             )
 

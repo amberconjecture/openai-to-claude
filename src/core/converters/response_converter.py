@@ -306,6 +306,19 @@ class OpenAIToAnthropicConverter:
 
                     data = line[6:]
                     if data == "[DONE]":
+                        if not state.has_finished:
+                            finish_events = process_finish_event(
+                                {"choices": [{"finish_reason": "stop"}]},
+                                state,
+                                request_id,
+                            )
+                            for event in finish_events:
+                                yield event
+                            _log_stream_completion_details(
+                                state,
+                                request_id,
+                                model,
+                            )
                         continue
                     try:
                         chunk_data = json.loads(data)
@@ -377,7 +390,6 @@ class OpenAIToAnthropicConverter:
                         if events:
                             for event in events:
                                 yield event
-                            continue
 
                         # 处理工具调用
                         if has_tool_calls:
@@ -385,7 +397,6 @@ class OpenAIToAnthropicConverter:
                             if events:
                                 for event in events:
                                     yield event
-                                continue
 
                         # 处理完成事件
                         finish_reason = choice.get("finish_reason")
@@ -414,6 +425,19 @@ class OpenAIToAnthropicConverter:
                             exc_info=True,
                         )
                         traceback.print_exc()
+
+            if not state.has_finished:
+                bound_logger.error(
+                    f"OpenAI stream ended before finish event - processed_chunks: {state.total_chunks}, buffer: {state.buffer[:100]}"
+                )
+                error_event = {
+                    "type": "error",
+                    "message": {
+                        "type": "api_error",
+                        "message": "OpenAI stream ended before a completion event was received",
+                    },
+                }
+                yield format_event("error", error_event)
 
         except Exception as error:
             bound_logger.error(
