@@ -1,34 +1,23 @@
 import json
 import time
-import traceback
-from collections.abc import AsyncIterator
 from typing import Any
 
-from ...common.token_cache import get_cached_tokens
 from loguru import logger
 
 from src.models.anthropic import (
-    AnthropicContentBlock,
     AnthropicContentTypes,
-    AnthropicMessageResponse,
-    AnthropicMessageTypes,
-    AnthropicPing,
-    AnthropicRoles,
     AnthropicStreamContentBlock,
     AnthropicStreamContentBlockStart,
     AnthropicStreamContentBlockStop,
     AnthropicStreamEventTypes,
     AnthropicStreamMessage,
-    AnthropicStreamMessageStartMessage,
     AnthropicUsage,
     ContentBlock,
     Delta,
     MessageDelta,
 )
-from src.models.openai import (
-    OpenAIChoice,
-    OpenAIMessage,
-)
+
+from ...common.token_cache import get_cached_tokens
 
 
 class StreamState:
@@ -133,10 +122,6 @@ def process_regular_content(delta: dict[str, Any], state: StreamState) -> list[s
             )
         )
         state.content_block_open = True
-        # ping 事件
-        events.append(
-            format_event(AnthropicStreamEventTypes.PING, AnthropicPing().model_dump())
-        )
 
     # 累积内容用于token计算
     content = delta.get("content", "")
@@ -181,9 +166,6 @@ def process_thinking_content(delta: dict[str, Any], state: StreamState) -> list[
             )
         )
         state.content_block_open = True
-        events.append(
-            format_event(AnthropicStreamEventTypes.PING, AnthropicPing().model_dump())
-        )
 
     # 提取思考内容
     thinking_content = None
@@ -321,11 +303,6 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
                 )
             )
             state.content_block_open = True
-            events.append(
-                format_event(
-                    AnthropicStreamEventTypes.PING, AnthropicPing().model_dump()
-                )
-            )
 
             # 保存工具调用信息
             state.tool_calls[tool_call_index] = {

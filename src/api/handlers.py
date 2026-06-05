@@ -4,7 +4,6 @@ Anthropic /v1/messages 端点处理程序
 实现Anthropic native messages API与OpenAI API的转换和代理
 """
 
-import asyncio
 import json
 from collections.abc import AsyncGenerator
 
@@ -112,7 +111,9 @@ class MessagesHandler:
             error_response = get_error_response(
                 422, details={"validation_errors": e.errors(), "request_id": request_id}
             )
-            raise HTTPException(status_code=422, detail=error_response.model_dump())
+            raise HTTPException(
+                status_code=422, detail=error_response.model_dump()
+            ) from e
 
         except json.JSONDecodeError as e:
             # 专门处理JSON解析错误，这通常发生在OpenAI响应解析时
@@ -124,7 +125,9 @@ class MessagesHandler:
                 message="上游服务返回无效JSON格式",
                 details={"json_error": str(e), "request_id": request_id},
             )
-            raise HTTPException(status_code=502, detail=error_response.model_dump())
+            raise HTTPException(
+                status_code=502, detail=error_response.model_dump()
+            ) from e
         except HTTPException as e:
             bound_logger.exception(
                 f"处理非流式消息请求错误 - Type: {type(e).__name__}, Error: {str(e)}"
@@ -135,7 +138,7 @@ class MessagesHandler:
             raise HTTPException(
                 status_code=e.status_code,
                 detail=error_response.model_dump(exclude_none=True),
-            )
+            ) from e
 
         except Exception as e:
             bound_logger.exception(
@@ -146,7 +149,7 @@ class MessagesHandler:
             )
             raise HTTPException(
                 status_code=500, detail=error_response.model_dump(exclude_none=True)
-            )
+            ) from e
 
     async def process_stream_message(
         self, request: AnthropicRequest, request_id: str = None
@@ -279,70 +282,25 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
 
         # 根据请求类型处理响应
         if anthropic_request.stream:
-            # 流式响应 - 优化配置确保真正的流式效果
-            async def stream_wrapper():
-                """包装器确保流式响应的立即传输"""
+            async def stream_response():
+                """直接透传 handler 生成的 SSE chunk。"""
                 stream = handler.process_stream_message(
                     anthropic_request, request_id=request_id
                 )
-                next_chunk_task = asyncio.create_task(stream.__anext__())
-
                 try:
-                    while True:
-                        done, _ = await asyncio.wait(
-                            {next_chunk_task}, timeout=5.0
-                        )
-                        if not done:
-                            yield b'event: ping\ndata: {"type":"ping"}\n\n'
-                            await asyncio.sleep(0)
-                            continue
-
-                        try:
-                            chunk = next_chunk_task.result()
-                        except StopAsyncIteration:
-                            break
-
-                        # 立即传输每个chunk，不缓冲
-                        # chunk已经是完整的SSE格式字符串，编码后返回
-                        yield chunk.encode("utf-8")
-                        # 强制刷新缓冲区（在某些环境中有效）
-                        await asyncio.sleep(0)
-                        next_chunk_task = asyncio.create_task(stream.__anext__())
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    # 如果流式处理出错，记录完整错误并发送错误事件
-                    bound_logger.exception(f"流式处理出错 - Error: {str(e)}")
-                    error_data = {"error": str(e)}
-                    if request_id:
-                        error_data["request_id"] = request_id
-                    error_event = f"event: error\ndata: {json.dumps(error_data)}\n\n"
-                    yield error_event.encode("utf-8")
+                    async for chunk in stream:
+                        yield chunk
                 finally:
-                    if not next_chunk_task.done():
-                        next_chunk_task.cancel()
-                        try:
-                            await next_chunk_task
-                        except (asyncio.CancelledError, StopAsyncIteration):
-                            pass
                     await stream.aclose()
 
             return StreamingResponse(
-                stream_wrapper(),
-                media_type="text/event-stream; charset=utf-8",
+                stream_response(),
+                media_type="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
+                    "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",  # 禁用nginx缓冲
+                    "X-Accel-Buffering": "no",
                     "X-Content-Type-Options": "nosniff",
-                    "Transfer-Encoding": "chunked",
-                    "Access-Control-Allow-Origin": "*",  # CORS支持
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Allow-Methods": "*",
-                    "X-Proxy-Buffering": "no",  # 禁用代理缓冲
-                    "Buffering": "no",  # 禁用缓冲
                 },
             )
         else:
@@ -362,14 +320,14 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
         )
         error_detail = error_response.model_dump()
         error_detail["request_id"] = request_id
-        raise HTTPException(status_code=422, detail=error_detail)
+        raise HTTPException(status_code=422, detail=error_detail) from e
 
     except json.JSONDecodeError as e:
         bound_logger.warning(f"请求中的JSON格式错误 - Error: {str(e)}")
         error_response = get_error_response(400, message="无效的JSON格式")
         error_detail = error_response.model_dump()
         error_detail["request_id"] = request_id
-        raise HTTPException(status_code=400, detail=error_detail)
+        raise HTTPException(status_code=400, detail=error_detail) from e
 
     except Exception as e:
         # 检查是否为HTTPException，避免重复记录已处理的错误
@@ -383,4 +341,4 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
         error_response = get_error_response(500, message=str(e))
         error_detail = error_response.model_dump()
         error_detail["request_id"] = request_id
-        raise HTTPException(status_code=500, detail=error_detail)
+        raise HTTPException(status_code=500, detail=error_detail) from e
