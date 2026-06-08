@@ -22,32 +22,38 @@ class RequestTimingMiddleware(BaseHTTPMiddleware):
 
         # 延迟导入
         from src.common.logging import (
+            SERVER_INTERFACE_LOG,
+            build_server_access_log,
+            build_server_error_access_log,
             generate_request_id,
-            get_logger_with_request_id,
             get_request_id_header_name,
+            write_interface_log,
         )
 
         # 生成请求ID并添加到请求状态中（默认启用）
         request_id = await generate_request_id()
         request.state.request_id = request_id
-
-        # 获取绑定了请求ID的logger
-        bound_logger = get_logger_with_request_id(request_id)
+        request.state.interface_log_start_time = start_time
 
         try:
             response = await call_next(request)
 
             response_time = time.time() - start_time
-            response_time_ms = round(response_time * 1000, 2)
-
-            # 使用绑定了请求ID的logger记录响应
-            bound_logger.info(
-                f"请求完成 - Status: {response.status_code}, Time: {response_time_ms}ms"
-            )
 
             response.headers["X-Process-Time"] = f"{response_time:.3f}s"
             header_name = await get_request_id_header_name()
             response.headers[header_name] = request_id
+            if not getattr(request.state, "defer_server_interface_log", False):
+                write_interface_log(
+                    SERVER_INTERFACE_LOG,
+                    build_server_access_log(
+                        request,
+                        response,
+                        response_time,
+                        request_id,
+                    ),
+                    request_id,
+                )
 
             return response
 
@@ -64,19 +70,18 @@ class RequestTimingMiddleware(BaseHTTPMiddleware):
             )
             header_name = await get_request_id_header_name()
             response.headers[header_name] = request_id
+            response.headers["X-Process-Time"] = f"{response_time:.3f}s"
 
-            # 使用绑定了请求ID的logger记录错误
-            # 安全构造错误日志 - 避免格式字符串问题
-            safe_url = str(request.url) if hasattr(request, "url") else "unknown"
-            safe_method = request.method if hasattr(request, "method") else "unknown"
-
-            bound_logger.error(
-                "请求处理错误",
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-                url=safe_url,
-                method=safe_method,
-                exc_info=True,
+            write_interface_log(
+                SERVER_INTERFACE_LOG,
+                build_server_error_access_log(
+                    request,
+                    response,
+                    exc,
+                    response_time,
+                    request_id,
+                ),
+                request_id,
             )
 
             return response

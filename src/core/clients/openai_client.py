@@ -3,12 +3,25 @@
 import codecs
 import json
 import os
+import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
 from loguru import logger
 
+from src.common.logging import (
+    CLIENT_INTERFACE_LOG,
+    build_client_access_log,
+    sanitize_log_mapping,
+    sanitize_url,
+    summarize_openai_request_payload,
+    summarize_openai_response_payload,
+    summarize_timeout,
+    summarize_token_usage,
+    write_interface_log,
+)
+from src.common.token_cache import get_cached_tokens
 from src.models.errors import StandardErrorResponse, get_error_response
 from src.models.openai import OpenAIRequest, OpenAIStreamResponse
 
@@ -18,7 +31,10 @@ class OpenAIClientError(Exception):
 
     def __init__(self, error_response: StandardErrorResponse):
         self.error_response = error_response
-        super().__init__(str(error_response))
+        error = error_response.error
+        super().__init__(
+            f"OpenAIClientError(code={error.code}, type={error.type}, param={error.param})"
+        )
 
 
 class OpenAIServiceClient:
@@ -141,50 +157,54 @@ class OpenAIServiceClient:
 
         url = f"{self.base_url}{endpoint}"
         request_data = request.model_dump(exclude_none=True)
-
-        # 记录请求详情
-        bound_logger.info(
-            f"发送OpenAI请求 - URL: {url}, Model: {request_data.get('model', 'unknown')}, Messages: {len(request_data.get('messages', []))}"
+        request_log = self._build_request_log(
+            "POST", url, endpoint, request_data, request_id=request_id
         )
 
+        start_time = time.perf_counter()
+        response_log: dict[str, Any] | None = None
+        access_error: Exception | dict[str, Any] | None = None
         try:
             response = await self.client.post(
                 url,
                 json=request_data,
             )
-            response.raise_for_status()
-            # 记录响应状态
-            content_type = response.headers.get("content-type", "unknown")
-            bound_logger.info(
-                f"收到OpenAI响应 - Status: {response.status_code}, Content-Type: {content_type}, Size: {len(response.content)} bytes"
+            response_time = time.perf_counter() - start_time
+            response_log = self._build_response_log(
+                response, response_time, len(response.content)
             )
+            response.raise_for_status()
 
             # 使用 response.text 让 httpx 自动处理编码和解压缩
             try:
                 text = response.text
                 result = json.loads(text)
+                token_usage = summarize_token_usage(result.get("usage"), "openai_usage")
+                if token_usage and response_log is not None:
+                    response_log["tokens"] = token_usage
 
-                # 记录响应内容（如果启用详细日志）
                 bound_logger.debug(
-                    f"OpenAI响应内容 - ID: {result.get('id', 'unknown')}, Model: {result.get('model', 'unknown')}, Usage: {result.get('usage', {})}"
+                    "OpenAI响应概要 - "
+                    f"{json.dumps(summarize_openai_response_payload(result), ensure_ascii=False, default=str, separators=(',', ':'))}"
                 )
 
             except json.JSONDecodeError as e:
-                # 记录详细的JSON解析错误信息
-                response_preview = (
-                    response.text[:500] if response.text else "Empty response"
-                )
                 content_type = response.headers.get("content-type", "unknown")
+                access_error = {
+                    "type": "json_decode_error",
+                    "message": str(e),
+                    "content_type": content_type,
+                }
                 bound_logger.exception(
                     f"OpenAI JSON解析失败 - Status: {response.status_code}, Content-Type: {content_type}, "
-                    f"Error: {str(e)}, Response Preview: {response_preview}"
+                    f"Content-Length: {response.headers.get('content-length')}, Size: {len(response.content)} bytes, Error: {str(e)}"
                 )
                 # 抛出包含更多上下文信息的异常
                 raise json.JSONDecodeError(
                     f"Failed to parse OpenAI response (Status: {response.status_code}): {str(e)}",
                     response.text,
                     e.pos,
-                )
+                ) from e
             return result
         except httpx.HTTPStatusError as e:
             # 安全读取响应内容（非流式模式）
@@ -195,9 +215,10 @@ class OpenAIServiceClient:
                 # 如果响应未被读取，直接获取错误信息
                 response_body = str(e)
 
-            bound_logger.error(
-                f"OpenAI API返回错误 - Endpoint: {endpoint}, Status: {e.response.status_code}, Response: {response_body[:200]}"
-            )
+            access_error = {
+                "type": "http_status_error",
+                "status_code": e.response.status_code,
+            }
 
             raise OpenAIClientError(
                 get_error_response(
@@ -205,9 +226,10 @@ class OpenAIServiceClient:
                     message=response_body,
                     details={"type": "http_error"},
                 )
-            )
+            ) from e
 
         except httpx.PoolTimeout as e:
+            access_error = e
             bound_logger.error(
                 f"OpenAI API connection pool timeout - Endpoint: {endpoint}, "
                 f"MaxConnections: {self.max_connections}, MaxKeepalive: {self.max_keepalive_connections}"
@@ -222,9 +244,10 @@ class OpenAIServiceClient:
                         "max_keepalive_connections": self.max_keepalive_connections,
                     },
                 )
-            )
+            ) from e
 
         except httpx.TimeoutException as e:
+            access_error = e
             bound_logger.error(
                 f"OpenAI API request timeout - Endpoint: {endpoint}, Timeout: {self.timeout}s"
             )
@@ -234,9 +257,10 @@ class OpenAIServiceClient:
                     message=str(e),
                     details={"type": "timeout_error", "original_error": str(e)},
                 )
-            )
+            ) from e
 
         except httpx.ConnectError as e:
+            access_error = e
             bound_logger.error(
                 f"OpenAI API connection error - Endpoint: {endpoint}, Error: {str(e)}"
             )
@@ -246,6 +270,18 @@ class OpenAIServiceClient:
                     message=str(e),
                     details={"type": "connection_error", "original_error": str(e)},
                 )
+            ) from e
+        finally:
+            write_interface_log(
+                CLIENT_INTERFACE_LOG,
+                build_client_access_log(
+                    request_log,
+                    response_log,
+                    time.perf_counter() - start_time,
+                    request_id,
+                    access_error,
+                ),
+                request_id,
             )
 
     async def send_streaming_request(
@@ -278,11 +314,20 @@ class OpenAIServiceClient:
         request_dict = request.model_dump(exclude_none=True)
         request_dict["stream"] = True
 
-        # 记录流式请求详情
-        bound_logger.info(
-            f"发送OpenAI流式请求 - URL: {url}, Model: {request_dict.get('model', 'unknown')}, Messages: {len(request_dict.get('messages', []))}, Stream: True"
+        request_log = self._build_request_log(
+            "POST", url, endpoint, request_dict, stream=True, request_id=request_id
         )
-        
+
+        start_time = time.perf_counter()
+        stream_done = False
+        bytes_received = 0
+        raw_chunk_count = 0
+        sse_line_count = 0
+        response: httpx.Response | None = None
+        response_log: dict[str, Any] | None = None
+        access_error: Exception | dict[str, Any] | None = None
+        token_usage: dict[str, Any] | None = None
+
         try:
             stream_timeout = httpx.Timeout(
                 connect=self.timeout,
@@ -296,18 +341,18 @@ class OpenAIServiceClient:
                 json=request_dict,
                 timeout=stream_timeout,
             ) as response:
-                response.raise_for_status()
-
-                # 记录流式响应开始
-                content_type = response.headers.get("content-type", "unknown")
-                bound_logger.info(
-                    f"开始接收OpenAI流式响应 - Status: {response.status_code}, Content-Type: {content_type}"
+                response_time = time.perf_counter() - start_time
+                response_log = self._build_response_log(
+                    response, response_time, None, stream=True
                 )
+                response.raise_for_status()
 
                 decoder = codecs.getincrementaldecoder("utf-8")()
                 buffer = ""
 
                 async for chunk_bytes in response.aiter_bytes():
+                    raw_chunk_count += 1
+                    bytes_received += len(chunk_bytes)
                     buffer += decoder.decode(chunk_bytes)
 
                     while "\n" in buffer:
@@ -316,13 +361,20 @@ class OpenAIServiceClient:
                         if not line:
                             continue
 
+                        sse_line_count += 1
+                        stream_token_usage = self._extract_stream_token_usage(line)
+                        if stream_token_usage:
+                            token_usage = stream_token_usage
                         yield line
                         if line == "data: [DONE]":
+                            stream_done = True
                             return
 
                 buffer += decoder.decode(b"", final=True)
                 if buffer.strip():
+                    sse_line_count += 1
                     yield buffer.strip()
+                stream_done = True
 
         except httpx.HTTPStatusError as e:
             error_body = ""
@@ -333,23 +385,27 @@ class OpenAIServiceClient:
             except Exception as read_error:
                 error_body = f"无法读取错误响应: {str(read_error)}"
 
-            # 记录完整错误信息，但在日志中截断过长内容
-            error_summary = (
-                error_body[:500] + "..." if len(error_body) > 500 else error_body
-            )
-            bound_logger.error(
-                f"OpenAI API 错误 - Status: {e.response.status_code}, URL: {url}"
-            )
-            bound_logger.error(f"Error Response: {error_summary}")
+            if response_log is None:
+                response_log = self._build_response_log(
+                    e.response,
+                    time.perf_counter() - start_time,
+                    None,
+                    stream=True,
+                )
+            access_error = {
+                "type": "http_status_error",
+                "status_code": e.response.status_code,
+            }
             raise OpenAIClientError(
                 get_error_response(
                     status_code=e.response.status_code,
-                    message=f"HTTP {e.response.status_code} error",
+                    message=error_body or f"HTTP {e.response.status_code} error",
                     details={"type": "http_error"},
                 )
-            )
+            ) from e
 
         except httpx.PoolTimeout as e:
+            access_error = e
             bound_logger.error(
                 f"OpenAI API 连接池超时 - MaxConnections: {self.max_connections}, MaxKeepalive: {self.max_keepalive_connections}"
             )
@@ -363,9 +419,10 @@ class OpenAIServiceClient:
                         "max_keepalive_connections": self.max_keepalive_connections,
                     },
                 )
-            )
+            ) from e
 
         except httpx.TimeoutException as e:
+            access_error = e
             bound_logger.error(f"OpenAI API 超时 - Error: {str(e)}")
             raise OpenAIClientError(
                 get_error_response(
@@ -373,9 +430,10 @@ class OpenAIServiceClient:
                     message="Request timeout",
                     details={"type": "timeout_error"},
                 )
-            )
+            ) from e
 
         except httpx.ConnectError as e:
+            access_error = e
             bound_logger.error(f"OpenAI API 连接错误 - Error: {str(e)}")
             raise OpenAIClientError(
                 get_error_response(
@@ -383,9 +441,10 @@ class OpenAIServiceClient:
                     message="Connection error",
                     details={"type": "connection_error"},
                 )
-            )
+            ) from e
 
         except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+            access_error = e
             bound_logger.error(
                 f"OpenAI API 流式连接中断 - Type: {type(e).__name__}, Error: {str(e)}"
             )
@@ -398,6 +457,29 @@ class OpenAIServiceClient:
                         "original_error": str(e),
                     },
                 )
+            ) from e
+        finally:
+            if response_log is not None:
+                if token_usage:
+                    response_log["tokens"] = token_usage
+                response_log.update(
+                    {
+                        "bytes_received": bytes_received,
+                        "raw_chunk_count": raw_chunk_count,
+                        "sse_line_count": sse_line_count,
+                        "done": stream_done,
+                    }
+                )
+            write_interface_log(
+                CLIENT_INTERFACE_LOG,
+                build_client_access_log(
+                    request_log,
+                    response_log,
+                    time.perf_counter() - start_time,
+                    request_id,
+                    access_error,
+                ),
+                request_id,
             )
 
     async def _parse_streaming_chunk(
@@ -457,3 +539,90 @@ class OpenAIServiceClient:
                 "api_accessible": False,
                 "last_check": True,
             }
+
+    def _build_request_log(
+        self,
+        method: str,
+        url: str,
+        endpoint: str,
+        request_data: dict[str, Any],
+        stream: bool = False,
+        request_id: str = None,
+    ) -> dict[str, Any]:
+        request_log = {
+            "direction": "outbound",
+            "method": method,
+            "url": sanitize_url(url),
+            "endpoint": endpoint,
+            "stream": stream,
+            "headers": sanitize_log_mapping(self.client.headers),
+            "timeout": summarize_timeout(self.timeout),
+            "stream_read_timeout": self.stream_read_timeout,
+            "connection_pool": {
+                "max_connections": self.max_connections,
+                "max_keepalive_connections": self.max_keepalive_connections,
+            },
+            "payload": summarize_openai_request_payload(request_data),
+        }
+        cached_tokens = get_cached_tokens(request_id) if request_id else None
+        if cached_tokens:
+            request_log["tokens"] = {
+                "source": "estimated_request",
+                "input_tokens": cached_tokens,
+            }
+        return request_log
+
+    def _build_response_log(
+        self,
+        response: httpx.Response,
+        response_time_seconds: float,
+        body_size_bytes: int | None,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "direction": "outbound",
+            "method": response.request.method,
+            "url": sanitize_url(response.url),
+            "stream": stream,
+            "status_code": response.status_code,
+            "reason_phrase": response.reason_phrase,
+            "http_version": response.http_version,
+            "elapsed_ms": round(response_time_seconds * 1000, 2),
+            "headers": sanitize_log_mapping(response.headers),
+            "content_type": response.headers.get("content-type"),
+            "content_length": response.headers.get("content-length"),
+            "body_size_bytes": body_size_bytes,
+            "redirect_count": len(response.history),
+            "redirect_history": [
+                {
+                    "status_code": item.status_code,
+                    "url": sanitize_url(item.url),
+                    "headers": sanitize_log_mapping(item.headers),
+                }
+                for item in response.history
+            ],
+        }
+
+    @staticmethod
+    def _extract_stream_token_usage(line: str) -> dict[str, Any] | None:
+        data = line.removeprefix("data:").strip() if line.startswith("data:") else line
+        if not data or data == "[DONE]":
+            return None
+
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        usage = payload.get("usage")
+        if usage is None:
+            choices = payload.get("choices")
+            if isinstance(choices, list) and choices:
+                first_choice = choices[0]
+                if isinstance(first_choice, dict):
+                    usage = first_choice.get("usage")
+
+        return summarize_token_usage(usage, "openai_usage")

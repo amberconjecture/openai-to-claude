@@ -6,12 +6,26 @@ Anthropic /v1/messages 端点处理程序
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
+from src.common.logging import (
+    SERVER_INTERFACE_LOG,
+    build_server_access_log,
+    format_log_fields,
+    sanitize_url,
+    summarize_anthropic_request_payload,
+    summarize_anthropic_response_payload,
+    summarize_openai_response_payload,
+    summarize_sse_event,
+    summarize_token_usage,
+    write_interface_log,
+)
 from src.core.clients.openai_client import OpenAIServiceClient
 from src.core.converters.request_converter import (
     AnthropicToOpenAIConverter,
@@ -28,6 +42,59 @@ router = APIRouter(prefix="/v1", tags=["messages"])
 STREAM_HEARTBEAT_INTERVAL_SECONDS = 5.0
 STREAM_HEARTBEAT_COMMENT = ": keep-alive\n\n"
 STREAM_CHUNK_IDLE_TIMEOUT_SECONDS = 300.0
+
+
+def _record_stream_token_usage(request: Request, event_text: str) -> None:
+    """从 Anthropic SSE 事件里提取 usage，写入最终接口日志上下文。"""
+    data_parts = []
+    for line in event_text.splitlines():
+        if line.startswith("data:"):
+            data_parts.append(line.removeprefix("data:").strip())
+
+    if not data_parts:
+        return
+
+    try:
+        event_data = json.loads("\n".join(data_parts))
+    except json.JSONDecodeError:
+        return
+
+    if not isinstance(event_data, dict):
+        return
+
+    usage = event_data.get("usage")
+    if usage is None:
+        message = event_data.get("message")
+        if isinstance(message, dict):
+            usage = message.get("usage")
+
+    token_usage = summarize_token_usage(usage, "anthropic_usage")
+    if token_usage:
+        request.state.interface_log_tokens = token_usage
+
+
+def _write_deferred_server_interface_log(
+    request: Request,
+    request_id: str | None,
+    response: StreamingResponse,
+) -> None:
+    """流式响应结束后写一行服务端接口日志。"""
+    if getattr(request.state, "server_interface_log_written", False):
+        return
+
+    request.state.server_interface_log_written = True
+    start_time = getattr(request.state, "interface_log_start_time", time.time())
+    response_time = time.time() - start_time
+    response_like = SimpleNamespace(
+        status_code=getattr(response, "status_code", 200),
+        headers=getattr(response, "headers", {}),
+        media_type=getattr(response, "media_type", "text/event-stream"),
+    )
+    write_interface_log(
+        SERVER_INTERFACE_LOG,
+        build_server_access_log(request, response_like, response_time, request_id),
+        request_id,
+    )
 
 
 class MessagesHandler:
@@ -89,24 +156,17 @@ class MessagesHandler:
                 openai_request, request_id=request_id
             )
             bound_logger.debug(
-                f"OpenAI 响应: {json.dumps(openai_response, ensure_ascii=False)}"
+                "OpenAI响应概要 - "
+                f"{format_log_fields(summarize_openai_response_payload(openai_response))}"
             )
 
             # 将 OpenAI 响应转回 Anthropic 格式
             anthropic_response = await self.response_converter.convert_response(
                 openai_response, request.model, request_id
             )
-            # 安全地提取响应文本
-            response_text = "empty"
-            if (
-                anthropic_response.content
-                and len(anthropic_response.content) > 0
-                and hasattr(anthropic_response.content[0], "text")
-                and anthropic_response.content[0].text
-            ):
-                response_text = anthropic_response.content[0].text
             bound_logger.info(
-                f"Anthropic 响应生成完成 - Text: {response_text[:100]}..., Usage: {anthropic_response.usage}"
+                "Anthropic响应生成完成 - "
+                f"{format_log_fields(summarize_anthropic_response_payload(anthropic_response))}"
             )
 
             return anthropic_response
@@ -187,7 +247,10 @@ class MessagesHandler:
                         if chunk is not None:
                             chunk_count += 1
                             # 将 OpenAI 响应对象转换为字符串格式
-                            bound_logger.debug(f"OpenAI event: {chunk}")
+                            bound_logger.debug(
+                                "OpenAI流式事件概要 - "
+                                f"{format_log_fields(summarize_sse_event(chunk))}"
+                            )
                             yield f"{chunk}\n\n"
                     bound_logger.debug(f"OpenAI流式生成完成，总共{chunk_count}个chunk")
                 finally:
@@ -200,7 +263,10 @@ class MessagesHandler:
             ) in self.response_converter.convert_openai_stream_to_anthropic_stream(
                 openai_stream_generator(), model=request.model, request_id=request_id
             ):
-                bound_logger.debug(f"Anthropic event: {anthropic_event}")
+                bound_logger.debug(
+                    "Anthropic流式事件概要 - "
+                    f"{format_log_fields(summarize_sse_event(anthropic_event))}"
+                )
                 yield anthropic_event
             bound_logger.info("流式转换完成")
 
@@ -266,17 +332,15 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
     # 记录请求
     client_ip = request.client.host if request.client else "unknown"
     bound_logger.info(
-        f"收到Anthropic请求 - Method: {request.method}, URL: {str(request.url)}, IP: {client_ip}"
+        f"收到Anthropic请求 - Method: {request.method}, URL: {sanitize_url(request.url)}, IP: {client_ip}"
     )
 
     try:
         # 解析请求体
         body = await request.json()
-        # 记录请求
-        log_body = body.copy()
-        log_body["tools"] = []
         bound_logger.debug(
-            f"Anthropic请求体 - Model: {body.get('model', 'unknown')}, Messages: {len(body.get('messages', []))}, Stream: {body.get('stream', False)}\n{json.dumps(log_body, ensure_ascii=False, indent=2)}"
+            "Anthropic请求概要 - "
+            f"{format_log_fields(summarize_anthropic_request_payload(body))}"
         )
 
         anthropic_request = AnthropicRequest(**body)
@@ -287,6 +351,8 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
 
         # 根据请求类型处理响应
         if anthropic_request.stream:
+            request.state.defer_server_interface_log = True
+
             async def stream_response():
                 """透传 SSE chunk，并用注释 heartbeat 避免空闲连接被中断。"""
                 stream = handler.process_stream_message(
@@ -342,6 +408,7 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
                             break
 
                         last_chunk_at = loop.time()
+                        _record_stream_token_usage(request, chunk)
                         yield chunk
                         next_chunk_task = asyncio.create_task(stream.__anext__())
                 except asyncio.CancelledError:
@@ -361,8 +428,13 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
                         except (asyncio.CancelledError, StopAsyncIteration):
                             pass
                     await stream.aclose()
+                    _write_deferred_server_interface_log(
+                        request,
+                        request_id,
+                        streaming_response,
+                    )
 
-            return StreamingResponse(
+            streaming_response = StreamingResponse(
                 stream_response(),
                 media_type="text/event-stream",
                 headers={
@@ -372,10 +444,15 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
                     "X-Content-Type-Options": "nosniff",
                 },
             )
+            return streaming_response
         else:
             # 非流式响应
             response = await handler.process_message(
                 anthropic_request, request_id=request_id
+            )
+            request.state.interface_log_tokens = summarize_token_usage(
+                response.usage,
+                "anthropic_usage",
             )
             json_response = JSONResponse(content=response.model_dump(exclude_none=True))
             if request_id:

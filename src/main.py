@@ -2,16 +2,18 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from loguru import logger
 
 from src.api.handlers import router as messages_router
 from src.api.middleware.auth import APIKeyMiddleware
 from src.api.middleware.timing import setup_middlewares
 from src.api.routes import router as health_router
+from src.common.logging import get_request_id_from_request
+from src.config.settings import Config
+from src.models.errors import get_error_response
 
 # 启动时同步加载配置（模块级别，应用启动时执行）
-from .common.logging import get_request_id_from_request
-from src.config.settings import Config
 
 config = Config.from_file_sync()
 
@@ -93,9 +95,9 @@ app.add_middleware(
     allow_headers=["*"],  # 允许所有请求头
 )
 
+app.add_middleware(APIKeyMiddleware, api_key=config.api_key)
 # 设置其他中间件
 setup_middlewares(app)
-app.add_middleware(APIKeyMiddleware, api_key=config.api_key)
 
 app.include_router(health_router)
 app.include_router(messages_router)
@@ -104,10 +106,6 @@ app.include_router(messages_router)
 @app.get("/")
 async def root():
     return {"message": "Welcome to the OpenAI To Claude Server"}
-
-
-from fastapi.responses import JSONResponse
-from src.models.errors import get_error_response
 
 
 # 全局异常处理程序

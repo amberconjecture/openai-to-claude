@@ -208,7 +208,7 @@ def process_thinking_content(delta: dict[str, Any], state: StreamState) -> list[
             index=state.content_index,
             delta=Delta(
                 type=AnthropicContentTypes.SIGNATURE_DELTA,
-                signature=f"{int(time.time()*1000)}",
+                signature=f"{int(time.time() * 1000)}",
             ),
         )
         events.append(
@@ -318,7 +318,6 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
             and tool_call.get("function", {}).get("name")
             and tool_call_index in state.tool_calls
         ):
-
             existing_tool_call = state.tool_calls[tool_call_index]
             was_temporary = existing_tool_call["id"].startswith(
                 "call_"
@@ -537,9 +536,15 @@ def _log_stream_completion_details(
             state, stop_reason, input_tokens, output_tokens, model
         )
 
-        # 输出完整的JSON格式日志
-        formatted_json = json.dumps(response_json, ensure_ascii=False, indent=4)
-        bound_logger.info(f"流式响应生成完成: {formatted_json}")
+        from src.common.logging import (
+            format_log_fields,
+            summarize_anthropic_response_payload,
+        )
+
+        bound_logger.info(
+            "流式响应生成完成 - "
+            f"{format_log_fields(summarize_anthropic_response_payload(response_json))}"
+        )
 
     except Exception as e:
         # 记录日志失败不应影响正常流程

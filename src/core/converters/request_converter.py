@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import HTTPException
 from loguru import logger
 
+from src.common.logging import format_log_fields, summarize_openai_request_payload
 from src.common.token_counter import TokenCounter
 from src.models.anthropic import (
     AnthropicMessage,
@@ -127,16 +128,16 @@ class AnthropicToOpenAIConverter:
             anthropic_request, request_id
         )
 
+        conversion_summary = {
+            "source_model": anthropic_request.model,
+            "target_model": target_model,
+            "message_count": len(anthropic_request.messages),
+            "has_tools": anthropic_request.tools is not None,
+            "has_system": anthropic_request.system is not None,
+            "thinking": anthropic_request.thinking,
+        }
         bound_logger.debug(
-            "将Anthropic请求转换为OpenAI格式",
-            extra={
-                "source_model": anthropic_request.model,
-                "target_model": target_model,
-                "message_count": len(anthropic_request.messages),
-                "has_tools": anthropic_request.tools is not None,
-                "has_system": anthropic_request.system is not None,
-                "thinking": anthropic_request.thinking,
-            },
+            f"将Anthropic请求转换为OpenAI格式 - {format_log_fields(conversion_summary)}"
         )
 
         # 转换消息列表
@@ -214,10 +215,9 @@ class AnthropicToOpenAIConverter:
         bound_logger.info(
             f"模型转换完成 - Anthropic: {anthropic_request.model} -> OpenAI: {openai_request.model}"
         )
-        log_openai_request = openai_request.model_copy()
-        log_openai_request.tools = []
         bound_logger.debug(
-            f"OpenAI 请求体: {log_openai_request.model_dump_json(exclude_none=True)}"
+            "OpenAI请求概要 - "
+            f"{format_log_fields(summarize_openai_request_payload(openai_request.model_dump(exclude_none=True)))}"
         )
         return openai_request
 
@@ -556,7 +556,6 @@ class AnthropicToOpenAIConverter:
                 and current_msg.tool_calls
                 and len(current_msg.tool_calls) > 0
             ):
-
                 # 检查后续消息是否有对应的tool消息
                 tool_call_ids = {
                     call.get("id") for call in current_msg.tool_calls if call.get("id")
