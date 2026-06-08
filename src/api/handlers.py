@@ -4,6 +4,7 @@ Anthropic /v1/messages 端点处理程序
 实现Anthropic native messages API与OpenAI API的转换和代理
 """
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 
@@ -23,6 +24,10 @@ from src.models.anthropic import (
 from src.models.errors import get_error_response
 
 router = APIRouter(prefix="/v1", tags=["messages"])
+
+STREAM_HEARTBEAT_INTERVAL_SECONDS = 5.0
+STREAM_HEARTBEAT_COMMENT = ": keep-alive\n\n"
+STREAM_CHUNK_IDLE_TIMEOUT_SECONDS = 300.0
 
 
 class MessagesHandler:
@@ -283,21 +288,85 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
         # 根据请求类型处理响应
         if anthropic_request.stream:
             async def stream_response():
-                """直接透传 handler 生成的 SSE chunk。"""
+                """透传 SSE chunk，并用注释 heartbeat 避免空闲连接被中断。"""
                 stream = handler.process_stream_message(
                     anthropic_request, request_id=request_id
                 )
+                next_chunk_task = asyncio.create_task(stream.__anext__())
+                loop = asyncio.get_running_loop()
+                last_chunk_at = loop.time()
                 try:
-                    async for chunk in stream:
+                    while True:
+                        idle_remaining = STREAM_CHUNK_IDLE_TIMEOUT_SECONDS - (
+                            loop.time() - last_chunk_at
+                        )
+                        if idle_remaining <= 0:
+                            error_data = get_error_response(
+                                504,
+                                message=(
+                                    "Streaming response timed out waiting for the next "
+                                    "chunk"
+                                ),
+                                details={
+                                    "type": "stream_chunk_timeout",
+                                    "timeout_seconds": STREAM_CHUNK_IDLE_TIMEOUT_SECONDS,
+                                },
+                            ).model_dump()
+                            if request_id:
+                                error_data["request_id"] = request_id
+                            yield (
+                                "event: error\n"
+                                f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+                            )
+                            break
+
+                        done, _ = await asyncio.wait(
+                            {next_chunk_task},
+                            timeout=min(
+                                STREAM_HEARTBEAT_INTERVAL_SECONDS,
+                                idle_remaining,
+                            ),
+                        )
+                        if not done:
+                            if (
+                                loop.time() - last_chunk_at
+                                >= STREAM_CHUNK_IDLE_TIMEOUT_SECONDS
+                            ):
+                                continue
+                            yield STREAM_HEARTBEAT_COMMENT
+                            continue
+
+                        try:
+                            chunk = next_chunk_task.result()
+                        except StopAsyncIteration:
+                            break
+
+                        last_chunk_at = loop.time()
                         yield chunk
+                        next_chunk_task = asyncio.create_task(stream.__anext__())
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    bound_logger.exception(f"流式处理出错 - Error: {str(e)}")
+                    error_data = {"error": str(e)}
+                    if request_id:
+                        error_data["request_id"] = request_id
+                    error_event = f"event: error\ndata: {json.dumps(error_data)}\n\n"
+                    yield error_event
                 finally:
+                    if not next_chunk_task.done():
+                        next_chunk_task.cancel()
+                        try:
+                            await next_chunk_task
+                        except (asyncio.CancelledError, StopAsyncIteration):
+                            pass
                     await stream.aclose()
 
             return StreamingResponse(
                 stream_response(),
                 media_type="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache",
+                    "Cache-Control": "no-cache, no-transform",
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
                     "X-Content-Type-Options": "nosniff",
